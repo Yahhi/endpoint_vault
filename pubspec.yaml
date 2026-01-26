@@ -1,0 +1,46 @@
+name: endpoint_vault
+description: >-
+  Encrypted endpoint failure capture, reliability statistics, and recovery tools
+  for Flutter apps. Powered by Serverpod. Capture critical API failures with
+  client-side redaction and encryption.
+version: 0.1.0
+homepage: https://endpoint.yahhi.me
+repository: https://github.com/endpointvault/endpoint_vault_flutter
+issue_tracker: https://github.com/endpointvault/endpoint_vault_flutter/issues
+documentation: https://endpoint.yahhi.me/docs
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+  flutter: '>=3.10.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  dio: ^5.4.0
+  encrypt: ^5.0.3
+  uuid: ^4.3.3
+  shared_preferences: ^2.2.2
+  connectivity_plus: ^5.0.2
+  crypto: ^3.0.3
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.1
+  mocktail: ^1.0.3
+
+flutter:
+
+topics:
+  - api
+  - monitoring
+  - error-handling
+  - encryption
+  - serverpod
+
+screenshots:
+  - description: 'EndpointVault dashboard showing endpoint reliability stats'
+    path: screenshots/dashboard.png
+
+funding:
+  - https://github.com/sponsors/endpointvault
