@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 
 import 'package:dio/dio.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -7,9 +6,15 @@ import 'package:uuid/uuid.dart';
 
 import 'config.dart';
 import 'models/captured_event.dart';
+import 'models/event_package.dart';
+import 'models/pending_request.dart';
+import 'models/server_response.dart';
+import 'models/server_settings.dart';
 import 'encryption/encryption_service.dart';
 import 'redaction/redaction_rules.dart';
-import 'storage/offline_queue.dart';
+import 'services/server_settings_service.dart';
+import 'services/retry_manager.dart';
+import 'storage/local_event_storage.dart';
 
 /// Main client for EndpointVault SDK.
 ///
@@ -35,7 +40,9 @@ class EndpointVault {
   final EndpointVaultConfig config;
   final EncryptionService _encryption;
   final RedactionService _redaction;
-  final OfflineQueue _offlineQueue;
+  final ServerSettingsService _settingsService;
+  final RetryManager _retryManager;
+  final LocalEventStorage _localStorage;
   final Dio _internalDio;
   final String _deviceId;
 
@@ -46,14 +53,24 @@ class EndpointVault {
     required this.config,
     required EncryptionService encryption,
     required RedactionService redaction,
-    required OfflineQueue offlineQueue,
+    required ServerSettingsService settingsService,
+    required RetryManager retryManager,
+    required LocalEventStorage localStorage,
     required Dio internalDio,
     required String deviceId,
   })  : _encryption = encryption,
         _redaction = redaction,
-        _offlineQueue = offlineQueue,
+        _settingsService = settingsService,
+        _retryManager = retryManager,
+        _localStorage = localStorage,
         _internalDio = internalDio,
         _deviceId = deviceId;
+
+  /// Current server settings.
+  ServerSettings get serverSettings => _settingsService.settings;
+
+  /// Whether local resend is enabled (from server settings).
+  bool get localResendEnabled => _settingsService.localResendEnabled;
 
   /// Initialize EndpointVault SDK.
   ///
@@ -94,19 +111,6 @@ class EndpointVault {
       debug: debug,
     );
 
-    // Initialize services
-    final encryption = EncryptionService(encryptionKey);
-    final redactionService = RedactionService(redaction);
-    final offlineQueue = OfflineQueue(maxOfflineQueueSize);
-
-    // Get or create device ID
-    final prefs = await SharedPreferences.getInstance();
-    var deviceId = prefs.getString('endpoint_vault_device_id');
-    if (deviceId == null) {
-      deviceId = const Uuid().v4();
-      await prefs.setString('endpoint_vault_device_id', deviceId);
-    }
-
     // Create internal Dio for API calls
     final internalDio = Dio(BaseOptions(
       baseUrl: serverUrl,
@@ -118,26 +122,57 @@ class EndpointVault {
       },
     ));
 
+    // Initialize services
+    final encryption = EncryptionService(encryptionKey);
+    final redactionService = RedactionService(redaction);
+    final settingsService = ServerSettingsService(dio: internalDio, debug: debug);
+    final retryManager = RetryManager(
+      maxRetries: retry.maxRetries,
+      baseDelay: retry.initialDelay,
+      debug: debug,
+    );
+    final localStorage = LocalEventStorage(
+      maxSize: maxOfflineQueueSize,
+      debug: debug,
+    );
+
+    // Get or create device ID
+    final prefs = await SharedPreferences.getInstance();
+    var deviceId = prefs.getString('endpoint_vault_device_id');
+    if (deviceId == null) {
+      deviceId = const Uuid().v4();
+      await prefs.setString('endpoint_vault_device_id', deviceId);
+    }
+
     _instance = EndpointVault._(
       config: config,
       encryption: encryption,
       redaction: redactionService,
-      offlineQueue: offlineQueue,
+      settingsService: settingsService,
+      retryManager: retryManager,
+      localStorage: localStorage,
       internalDio: internalDio,
       deviceId: deviceId,
     );
 
+    // Set up retry executor
+    _instance!._retryManager.setExecutor(_instance!._executeRetry);
+
     _instance!._isInitialized = true;
 
-    // Process offline queue
+    // Fetch server settings
+    await settingsService.fetchSettings();
+
+    // Start processing pending retries
     if (enableOfflineQueue) {
-      await _instance!._processOfflineQueue();
+      await retryManager.startProcessing();
     }
 
     if (debug) {
       print('[EndpointVault] Initialized successfully');
       print('[EndpointVault] Device ID: $deviceId');
       print('[EndpointVault] Environment: $environment');
+      print('[EndpointVault] Local resend enabled: ${settingsService.localResendEnabled}');
     }
 
     return _instance!;
@@ -157,8 +192,8 @@ class EndpointVault {
     Duration? duration,
     Map<String, dynamic>? extra,
   }) async {
-    final event = CapturedEvent(
-      id: const Uuid().v4(),
+    final eventData = EventData(
+      eventId: const Uuid().v4(),
       timestamp: DateTime.now().toUtc(),
       method: method,
       url: url,
@@ -174,9 +209,10 @@ class EndpointVault {
       appVersion: config.appVersion,
       deviceId: _deviceId,
       extra: extra,
+      isSuccess: false,
     );
 
-    await _sendEvent(event, encrypt: true);
+    await _processEvent(eventData, isError: true);
   }
 
   /// Capture success stats (no payload, just metrics).
@@ -188,8 +224,8 @@ class EndpointVault {
   }) async {
     if (!config.captureSuccessStats) return;
 
-    final event = CapturedEvent(
-      id: const Uuid().v4(),
+    final eventData = EventData(
+      eventId: const Uuid().v4(),
       timestamp: DateTime.now().toUtc(),
       method: method,
       url: url,
@@ -201,33 +237,101 @@ class EndpointVault {
       isSuccess: true,
     );
 
-    await _sendEvent(event, encrypt: false);
+    await _processEvent(eventData, isError: false);
   }
 
-  /// Send event to EndpointVault server.
-  Future<void> _sendEvent(CapturedEvent event, {required bool encrypt}) async {
+  /// Process an event according to the new logic:
+  /// - Success: send only statistical package
+  /// - Error with normal status: send encrypted + statistical
+  /// - If local resend enabled: also store unencrypted locally
+  /// - If server unavailable: queue for retry
+  Future<void> _processEvent(EventData eventData, {required bool isError}) async {
+    final statisticalPackage = eventData.toStatisticalPackage();
+
+    // For successful requests, only send stats
+    if (!isError) {
+      await _sendStatisticalPackage(statisticalPackage, eventData);
+      return;
+    }
+
+    // For errors, prepare encrypted package
+    final encryptedPackage = eventData.toEncryptedPackage(
+      encryptFn: _encryption.encrypt,
+    );
+
+    // If local resend is enabled, store unencrypted data locally
+    if (localResendEnabled) {
+      final unencryptedPackage = eventData.toUnencryptedPackage();
+      await _localStorage.store(unencryptedPackage);
+    }
+
+    // Try to send to server
+    await _sendErrorPackages(
+      statisticalPackage: statisticalPackage,
+      encryptedPackage: encryptedPackage,
+      eventData: eventData,
+    );
+  }
+
+  /// Send only statistical package (for successful requests).
+  Future<void> _sendStatisticalPackage(
+    StatisticalPackage package,
+    EventData eventData,
+  ) async {
     try {
-      Map<String, dynamic> payload = event.toJson();
+      final response = await _internalDio.post(
+        '/v1/events/stats',
+        data: package.toJson(),
+      );
 
-      if (encrypt && event.requestBody != null) {
-        payload['requestBody'] = _encryption.encrypt(
-          jsonEncode(event.requestBody),
-        );
-        payload['encrypted'] = true;
-      }
+      final serverResponse = _parseResponse(response);
+      await _handleRetryCommand(serverResponse, eventData, {PackageType.statistical});
 
-      if (encrypt && event.responseBody != null) {
-        payload['responseBody'] = _encryption.encrypt(
-          jsonEncode(event.responseBody),
-        );
-      }
-
-      await _internalDio.post('/v1/events', data: payload);
-
-      _eventStreamController?.add(event);
+      _notifyEventCaptured(eventData);
 
       if (config.debug) {
-        print('[EndpointVault] Event captured: ${event.method} ${event.url}');
+        print('[EndpointVault] Stats captured: ${eventData.method} ${eventData.url}');
+      }
+    } catch (e) {
+      if (config.debug) {
+        print('[EndpointVault] Failed to send stats: $e');
+      }
+
+      if (config.enableOfflineQueue) {
+        await _queueForRetry(eventData, {PackageType.statistical});
+      }
+    }
+  }
+
+  /// Send error packages (encrypted + statistical).
+  Future<void> _sendErrorPackages({
+    required StatisticalPackage statisticalPackage,
+    required EncryptedPackage encryptedPackage,
+    required EventData eventData,
+  }) async {
+    try {
+      // Send both encrypted and statistical data
+      final payload = {
+        'encrypted': encryptedPackage.toJson(),
+        'stats': statisticalPackage.toJson(),
+      };
+
+      final response = await _internalDio.post(
+        '/v1/events',
+        data: payload,
+      );
+
+      final serverResponse = _parseResponse(response);
+      await _handleRetryCommand(
+        serverResponse,
+        eventData,
+        {PackageType.encrypted, PackageType.statistical},
+      );
+
+      _notifyEventCaptured(eventData);
+
+      if (config.debug) {
+        print('[EndpointVault] Event captured: ${eventData.method} ${eventData.url}');
       }
     } catch (e) {
       if (config.debug) {
@@ -235,38 +339,168 @@ class EndpointVault {
       }
 
       if (config.enableOfflineQueue) {
-        await _offlineQueue.add(event);
-        if (config.debug) {
-          print('[EndpointVault] Event queued for later');
-        }
+        await _queueForRetry(
+          eventData,
+          {PackageType.encrypted, PackageType.statistical},
+        );
       }
     }
   }
 
-  /// Process queued events from offline storage.
-  Future<void> _processOfflineQueue() async {
-    final events = await _offlineQueue.getAll();
-    if (events.isEmpty) return;
+  /// Queue an event for retry when server is unavailable.
+  Future<void> _queueForRetry(
+    EventData eventData,
+    Set<PackageType> packagesToSend,
+  ) async {
+    final pendingRequest = PendingRequest(
+      id: const Uuid().v4(),
+      eventId: eventData.eventId,
+      createdAt: DateTime.now(),
+      statisticalPackage: eventData.toStatisticalPackage(),
+      encryptedPackage: packagesToSend.contains(PackageType.encrypted)
+          ? eventData.toEncryptedPackage(encryptFn: _encryption.encrypt)
+          : null,
+      unencryptedPackage: localResendEnabled ? eventData.toUnencryptedPackage() : null,
+      packagesToSend: packagesToSend,
+    );
+
+    await _retryManager.addPendingRequest(pendingRequest);
 
     if (config.debug) {
-      print('[EndpointVault] Processing ${events.length} queued events');
+      print('[EndpointVault] Event queued for retry: ${eventData.eventId}');
     }
+  }
 
-    for (final event in events) {
-      try {
-        await _sendEvent(event, encrypt: true);
-        await _offlineQueue.remove(event.id);
-      } catch (e) {
-        // Keep in queue for next attempt
-        break;
+  /// Execute a retry for a pending request.
+  Future<bool> _executeRetry(PendingRequest request) async {
+    try {
+      if (request.packagesToSend.contains(PackageType.encrypted) && request.encryptedPackage != null) {
+        // Send error packages
+        final payload = {
+          'encrypted': request.encryptedPackage!.toJson(),
+          if (request.statisticalPackage != null) 'stats': request.statisticalPackage!.toJson(),
+        };
+
+        final response = await _internalDio.post('/v1/events', data: payload);
+        final serverResponse = _parseResponse(response);
+
+        if (serverResponse.hasRetryCommand) {
+          await _retryManager.handleRetryCommand(
+            serverResponse.retryCommand!,
+            request,
+          );
+          return false; // Will be retried with new parameters
+        }
+
+        return true;
+      } else if (request.statisticalPackage != null) {
+        // Send only stats
+        final response = await _internalDio.post(
+          '/v1/events/stats',
+          data: request.statisticalPackage!.toJson(),
+        );
+        final serverResponse = _parseResponse(response);
+
+        if (serverResponse.hasRetryCommand) {
+          await _retryManager.handleRetryCommand(
+            serverResponse.retryCommand!,
+            request,
+          );
+          return false;
+        }
+
+        return true;
       }
+
+      return true;
+    } catch (e) {
+      if (config.debug) {
+        print('[EndpointVault] Retry failed: $e');
+      }
+      return false;
     }
+  }
+
+  ServerResponse _parseResponse(Response response) {
+    if (response.data is Map<String, dynamic>) {
+      return ServerResponse.fromJson(response.data);
+    }
+    return const ServerResponse(success: true);
+  }
+
+  Future<void> _handleRetryCommand(
+    ServerResponse response,
+    EventData eventData,
+    Set<PackageType> packagesToSend,
+  ) async {
+    if (!response.hasRetryCommand) return;
+
+    final pendingRequest = PendingRequest(
+      id: const Uuid().v4(),
+      eventId: eventData.eventId,
+      createdAt: DateTime.now(),
+      retryId: response.retryCommand!.retryId,
+      statisticalPackage: eventData.toStatisticalPackage(),
+      encryptedPackage: packagesToSend.contains(PackageType.encrypted)
+          ? eventData.toEncryptedPackage(encryptFn: _encryption.encrypt)
+          : null,
+      packagesToSend: packagesToSend,
+    );
+
+    await _retryManager.handleRetryCommand(
+      response.retryCommand!,
+      pendingRequest,
+    );
+  }
+
+  void _notifyEventCaptured(EventData eventData) {
+    if (_eventStreamController == null) return;
+
+    // Convert to CapturedEvent for backward compatibility
+    final event = CapturedEvent(
+      id: eventData.eventId,
+      timestamp: eventData.timestamp,
+      method: eventData.method,
+      url: eventData.url,
+      statusCode: eventData.statusCode,
+      errorType: eventData.errorType,
+      errorMessage: eventData.errorMessage,
+      requestHeaders: eventData.requestHeaders,
+      requestBody: eventData.requestBody,
+      responseHeaders: eventData.responseHeaders,
+      responseBody: eventData.responseBody,
+      durationMs: eventData.durationMs,
+      environment: eventData.environment,
+      appVersion: eventData.appVersion,
+      deviceId: eventData.deviceId,
+      extra: eventData.extra,
+      isSuccess: eventData.isSuccess,
+    );
+
+    _eventStreamController!.add(event);
   }
 
   /// Stream of captured events (for debugging/monitoring).
   Stream<CapturedEvent> get eventStream {
     _eventStreamController ??= StreamController<CapturedEvent>.broadcast();
     return _eventStreamController!.stream;
+  }
+
+  /// Get locally stored event for replay (only available if local resend enabled).
+  Future<UnencryptedPackage?> getLocalEvent(String eventId) async {
+    if (!localResendEnabled) return null;
+    return _localStorage.get(eventId);
+  }
+
+  /// Get all locally stored events.
+  Future<List<UnencryptedPackage>> getLocalEvents() async {
+    if (!localResendEnabled) return [];
+    return _localStorage.getAll();
+  }
+
+  /// Remove a locally stored event after successful replay.
+  Future<void> removeLocalEvent(String eventId) async {
+    await _localStorage.remove(eventId);
   }
 
   /// Check if a replay request is pending for this device.
@@ -311,9 +545,22 @@ class EndpointVault {
     }
   }
 
+  /// Refresh server settings.
+  Future<void> refreshSettings() async {
+    await _settingsService.fetchSettings();
+  }
+
+  /// Get pending retry count.
+  Future<int> get pendingRetryCount => _retryManager.pendingCount;
+
+  /// Get local event count.
+  Future<int> get localEventCount => _localStorage.count;
+
   /// Dispose resources.
   void dispose() {
     _eventStreamController?.close();
+    _retryManager.dispose();
+    _localStorage.dispose();
     _internalDio.close();
   }
 }

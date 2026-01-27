@@ -7,6 +7,8 @@
 
 EndpointVault helps you stop losing valuable user data when API requests fail. Capture critical failures with client-side encryption, track endpoint reliability, and recover failed requests — all while keeping sensitive data secure.
 
+🌐 **[endpoint.yahhi.me](https://endpoint.yahhi.me)** — Dashboard, documentation, and backend setup
+
 ## Features
 
 - **Encrypted Capture** — Payloads are encrypted client-side before storage
@@ -358,24 +360,41 @@ class MyApp extends StatelessWidget {
 }
 ```
 
+## How It Works
+
+1. **Initialize** — SDK fetches server settings and sets up encryption
+2. **Intercept** — Dio interceptor captures all requests automatically
+3. **Process** — On failure: redact sensitive data → encrypt payload → send to server
+4. **Store** — Server stores encrypted data (only you can decrypt with your key)
+5. **Retry** — If server unavailable, queue locally and retry with exponential backoff
+6. **Replay** — Optionally replay failed requests from device with fresh auth tokens
+
+For detailed architecture and data flow, visit [endpoint.yahhi.me/docs/how-it-works](https://endpoint.yahhi.me/docs/how-it-works).
+
 ## Dashboard
 
 View your endpoint statistics and captured events at [endpoint.yahhi.me](https://endpoint.yahhi.me).
 
-- **Endpoint Stats**: Error rates, latency, status code distribution
-- **Event Browser**: Search and filter captured events
-- **Replay Tools**: Server-side or device-side replay
-- **Alerts**: Email, Slack, and webhook notifications
+- **Endpoint Stats** — Error rates, latency, status code distribution
+- **Event Browser** — Search and filter captured events  
+- **Replay Tools** — Server-side or device-side replay
+- **Alerts** — Email, Slack, and webhook notifications
+- **API Keys** — Manage your API keys and encryption settings
 
-## API Reference
+## Backend & API
 
-See the [API documentation](https://pub.dev/documentation/endpoint_vault/latest/) for detailed class and method documentation.
+EndpointVault backend is built on [Serverpod](https://serverpod.dev). You can use our hosted service or self-host on your infrastructure.
+
+- **Hosted Service** — [endpoint.yahhi.me](https://endpoint.yahhi.me) (recommended for quick start)
+- **Self-Hosting Guide** — [endpoint.yahhi.me/docs/self-hosting](https://endpoint.yahhi.me/docs/self-hosting)
+- **API Documentation** — [endpoint.yahhi.me/docs/api](https://endpoint.yahhi.me/docs/api)
 
 ## Support
 
-- **Documentation**: [endpoint.yahhi.me/docs](https://endpoint.yahhi.me/docs)
-- **Issues**: [GitHub Issues](https://github.com/endpointvault/endpoint_vault_flutter/issues)
-- **Email**: support@endpoint.yahhi.me
+- **Documentation** — [endpoint.yahhi.me/docs](https://endpoint.yahhi.me/docs)
+- **Getting Started** — [endpoint.yahhi.me/docs/getting-started](https://endpoint.yahhi.me/docs/getting-started)
+- **GitHub Issues** — [github.com/endpointvault/endpoint_vault_flutter/issues](https://github.com/endpointvault/endpoint_vault_flutter/issues)
+- **Email** — support@endpoint.yahhi.me
 
 ## License
 

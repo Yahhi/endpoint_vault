@@ -34,3 +34,6 @@ pubspec.lock
 
 # Don't ignore example's pubspec.lock
 !example/pubspec.lock
+
+# API documentation (auto-generated)
+**/doc/api/
