@@ -13,6 +13,7 @@ EndpointVault helps you stop losing valuable user data when API requests fail. C
 
 - **Encrypted Capture** — Payloads are encrypted client-side before storage
 - **Automatic Redaction** — Sensitive fields (passwords, tokens, PII) are redacted by default
+- **File Attachment Support** — Capture file uploads from FormData requests
 - **Endpoint Statistics** — Track error rates, status codes, and latency per endpoint
 - **Dio Integration** — Drop-in interceptor for automatic capture
 - **Offline Queue** — Queue events when offline, sync when connected
@@ -109,6 +110,13 @@ await EndpointVault.init(
     initialDelay: Duration(seconds: 1),
     maxDelay: Duration(seconds: 30),
   ),
+
+  // File attachment capture (for FormData requests)
+  captureFileAttachments: true,           // Enable file capture (default: true)
+  maxAttachmentFileSize: 52428800,        // Max single file: 50MB
+  maxTotalAttachmentSize: 104857600,      // Max total per event: 100MB
+  maxAttachmentsPerEvent: 10,             // Max files per event
+  attachmentRetentionDuration: Duration(days: 7), // Local cleanup period
 );
 ```
 
@@ -121,6 +129,9 @@ dio.interceptors.add(EndpointVaultInterceptor(
 
   // Capture success statistics (default: true)
   captureSuccessStats: true,
+
+  // Capture file attachments from FormData (default: true)
+  captureFileAttachments: true,
 
   // Custom filter for which requests to capture
   shouldCapture: (request) {
@@ -165,6 +176,95 @@ final decrypted = encryption.decrypt(encrypted);
 final encryptedJson = encryption.encryptJson({'user': 'data'});
 final decryptedJson = encryption.decryptJson(encryptedJson);
 ```
+
+## File Attachments
+
+EndpointVault automatically captures file uploads from FormData requests when they fail. This solves the problem where `MultipartFile` streams are consumed during request transmission and cannot be read again after a failure.
+
+### How It Works
+
+1. **Pre-request Capture** — When a FormData request is detected, files are extracted and encrypted before the request is sent
+2. **Transparent Replacement** — The original FormData is replaced with a fresh copy containing new streams
+3. **On Success** — Captured files are automatically cleaned up
+4. **On Failure** — Files are included with the failure event and uploaded to the server
+
+### Basic Usage
+
+File attachment capture is enabled by default. Just use FormData as usual:
+
+```dart
+final formData = FormData.fromMap({
+  'description': 'User profile photo',
+  'file': await MultipartFile.fromFile(
+    '/path/to/photo.jpg',
+    filename: 'photo.jpg',
+  ),
+});
+
+// If this request fails, the file will be captured
+await dio.post(
+  '/api/upload',
+  data: formData,
+  options: Options().critical(),
+);
+```
+
+### Configuration
+
+```dart
+await EndpointVault.init(
+  // ... other config
+
+  // Enable/disable file capture (default: true)
+  captureFileAttachments: true,
+
+  // Maximum size for a single file (default: 50MB)
+  maxAttachmentFileSize: 52428800,
+
+  // Maximum total size per event (default: 100MB)
+  maxTotalAttachmentSize: 104857600,
+
+  // Maximum number of files per event (default: 10)
+  maxAttachmentsPerEvent: 10,
+
+  // How long to keep files locally before cleanup (default: 7 days)
+  attachmentRetentionDuration: Duration(days: 7),
+
+  // Custom storage directory (optional)
+  attachmentStorageDir: '/custom/path',
+);
+```
+
+### Skip Attachment Capture
+
+To skip file capture for specific requests:
+
+```dart
+// Skip attachment capture but still capture the request
+dio.post('/api/upload',
+  data: formData,
+  options: Options(extra: {'ev_skip_attachments': true}),
+);
+
+// Skip capture entirely
+dio.post('/api/upload',
+  data: formData,
+  options: Options().skipCapture(),
+);
+```
+
+### Storage & Cleanup
+
+- Files are encrypted using AES-256 before being stored on device
+- Successful requests automatically delete captured files
+- Old files are cleaned up based on `attachmentRetentionDuration`
+- Manual cleanup: `await EndpointVault.instance.cleanupAttachments()`
+
+### Limitations
+
+- Files larger than `maxAttachmentFileSize` are skipped
+- If total size exceeds `maxTotalAttachmentSize`, remaining files are skipped
+- Maximum of `maxAttachmentsPerEvent` files per request
 
 ## Redaction
 
@@ -364,10 +464,12 @@ class MyApp extends StatelessWidget {
 
 1. **Initialize** — SDK fetches server settings and sets up encryption
 2. **Intercept** — Dio interceptor captures all requests automatically
-3. **Process** — On failure: redact sensitive data → encrypt payload → send to server
-4. **Store** — Server stores encrypted data (only you can decrypt with your key)
-5. **Retry** — If server unavailable, queue locally and retry with exponential backoff
-6. **Replay** — Optionally replay failed requests from device with fresh auth tokens
+3. **Extract Files** — For FormData requests, files are captured before transmission
+4. **Process** — On failure: redact sensitive data → encrypt payload → send to server
+5. **Store** — Server stores encrypted data (only you can decrypt with your key)
+6. **Upload Files** — Encrypted file attachments are uploaded separately
+7. **Retry** — If server unavailable, queue locally and retry with exponential backoff
+8. **Replay** — Optionally replay failed requests from device with fresh auth tokens
 
 For detailed architecture and data flow, visit [endpoint.yahhi.me/docs/how-it-works](https://endpoint.yahhi.me/docs/how-it-works).
 
