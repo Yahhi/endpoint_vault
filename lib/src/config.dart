@@ -38,6 +38,35 @@ class EndpointVaultConfig {
   /// Debug mode - logs to console.
   final bool debug;
 
+  /// Enable file attachment capture from FormData requests.
+  ///
+  /// When enabled, file attachments in FormData requests are captured
+  /// before the request is sent, encrypted, and stored on the device.
+  /// If the request fails, the encrypted files are included with the failure event.
+  final bool captureFileAttachments;
+
+  /// Maximum size for a single file attachment in bytes.
+  /// Default is 50MB (52,428,800 bytes).
+  final int maxAttachmentFileSize;
+
+  /// Maximum total size of all attachments per event in bytes.
+  /// Default is 100MB (104,857,600 bytes).
+  final int maxTotalAttachmentSize;
+
+  /// Maximum number of attachments per event.
+  /// Default is 10.
+  final int maxAttachmentsPerEvent;
+
+  /// Custom directory for storing encrypted attachment files.
+  ///
+  /// If null, uses the application's documents directory with
+  /// an 'endpoint_vault_attachments' subdirectory.
+  final String? attachmentStorageDir;
+
+  /// How long to retain attachment files on device before cleanup.
+  /// Default is 7 days.
+  final Duration attachmentRetentionDuration;
+
   const EndpointVaultConfig({
     required this.apiKey,
     required this.encryptionKey,
@@ -51,6 +80,12 @@ class EndpointVaultConfig {
     this.redaction = const RedactionConfig(),
     this.retry = const RetryConfig(),
     this.debug = false,
+    this.captureFileAttachments = true,
+    this.maxAttachmentFileSize = 52428800, // 50MB
+    this.maxTotalAttachmentSize = 104857600, // 100MB
+    this.maxAttachmentsPerEvent = 10,
+    this.attachmentStorageDir,
+    this.attachmentRetentionDuration = const Duration(days: 7),
   });
 
   EndpointVaultConfig copyWith({
@@ -66,6 +101,12 @@ class EndpointVaultConfig {
     RedactionConfig? redaction,
     RetryConfig? retry,
     bool? debug,
+    bool? captureFileAttachments,
+    int? maxAttachmentFileSize,
+    int? maxTotalAttachmentSize,
+    int? maxAttachmentsPerEvent,
+    String? attachmentStorageDir,
+    Duration? attachmentRetentionDuration,
   }) {
     return EndpointVaultConfig(
       apiKey: apiKey ?? this.apiKey,
@@ -80,6 +121,17 @@ class EndpointVaultConfig {
       redaction: redaction ?? this.redaction,
       retry: retry ?? this.retry,
       debug: debug ?? this.debug,
+      captureFileAttachments:
+          captureFileAttachments ?? this.captureFileAttachments,
+      maxAttachmentFileSize:
+          maxAttachmentFileSize ?? this.maxAttachmentFileSize,
+      maxTotalAttachmentSize:
+          maxTotalAttachmentSize ?? this.maxTotalAttachmentSize,
+      maxAttachmentsPerEvent:
+          maxAttachmentsPerEvent ?? this.maxAttachmentsPerEvent,
+      attachmentStorageDir: attachmentStorageDir ?? this.attachmentStorageDir,
+      attachmentRetentionDuration:
+          attachmentRetentionDuration ?? this.attachmentRetentionDuration,
     );
   }
 }

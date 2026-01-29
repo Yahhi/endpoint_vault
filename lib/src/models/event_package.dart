@@ -1,5 +1,7 @@
 import 'dart:convert';
 
+import 'file_attachment.dart';
+
 /// Statistical data package - minimal metrics only, no sensitive data.
 class StatisticalPackage {
   final String eventId;
@@ -14,6 +16,15 @@ class StatisticalPackage {
   final bool isSuccess;
   final String? errorType;
 
+  /// Whether this event has file attachments.
+  final bool hasAttachments;
+
+  /// Number of file attachments.
+  final int attachmentCount;
+
+  /// Total size of all attachments in bytes.
+  final int totalAttachmentBytes;
+
   const StatisticalPackage({
     required this.eventId,
     required this.timestamp,
@@ -26,6 +37,9 @@ class StatisticalPackage {
     this.deviceId,
     this.isSuccess = false,
     this.errorType,
+    this.hasAttachments = false,
+    this.attachmentCount = 0,
+    this.totalAttachmentBytes = 0,
   });
 
   Map<String, dynamic> toJson() => {
@@ -40,6 +54,9 @@ class StatisticalPackage {
         if (deviceId != null) 'deviceId': deviceId,
         'isSuccess': isSuccess,
         if (errorType != null) 'errorType': errorType,
+        'hasAttachments': hasAttachments,
+        'attachmentCount': attachmentCount,
+        'totalAttachmentBytes': totalAttachmentBytes,
       };
 
   factory StatisticalPackage.fromJson(Map<String, dynamic> json) {
@@ -55,6 +72,9 @@ class StatisticalPackage {
       deviceId: json['deviceId'],
       isSuccess: json['isSuccess'] ?? false,
       errorType: json['errorType'],
+      hasAttachments: json['hasAttachments'] ?? false,
+      attachmentCount: json['attachmentCount'] ?? 0,
+      totalAttachmentBytes: json['totalAttachmentBytes'] ?? 0,
     );
   }
 }
@@ -78,6 +98,10 @@ class EncryptedPackage {
   final String? deviceId;
   final Map<String, dynamic>? extra;
 
+  /// Encrypted file attachment metadata.
+  /// The actual file data is stored separately and uploaded via uploadAttachment.
+  final List<EncryptedFileAttachment>? attachments;
+
   const EncryptedPackage({
     required this.eventId,
     required this.timestamp,
@@ -95,6 +119,7 @@ class EncryptedPackage {
     this.appVersion,
     this.deviceId,
     this.extra,
+    this.attachments,
   });
 
   Map<String, dynamic> toJson() => {
@@ -118,6 +143,8 @@ class EncryptedPackage {
         if (appVersion != null) 'appVersion': appVersion,
         if (deviceId != null) 'deviceId': deviceId,
         if (extra != null) 'extra': extra,
+        if (attachments != null && attachments!.isNotEmpty)
+          'attachments': attachments!.map((a) => a.toJson()).toList(),
       };
 
   factory EncryptedPackage.fromJson(Map<String, dynamic> json) {
@@ -138,6 +165,11 @@ class EncryptedPackage {
       appVersion: json['appVersion'],
       deviceId: json['deviceId'],
       extra: json['extra'],
+      attachments: json['attachments'] != null
+          ? (json['attachments'] as List)
+              .map((a) => EncryptedFileAttachment.fromJson(a))
+              .toList()
+          : null,
     );
   }
 }
@@ -161,6 +193,14 @@ class UnencryptedPackage {
   final String? deviceId;
   final Map<String, dynamic>? extra;
 
+  /// File attachments with metadata and local file paths.
+  /// Files are stored encrypted on the device file system.
+  final List<FileAttachment>? attachments;
+
+  /// Form fields extracted from FormData (non-file entries).
+  /// Used for replay to reconstruct the original FormData.
+  final List<Map<String, String>>? formFields;
+
   const UnencryptedPackage({
     required this.eventId,
     required this.timestamp,
@@ -178,6 +218,8 @@ class UnencryptedPackage {
     this.appVersion,
     this.deviceId,
     this.extra,
+    this.attachments,
+    this.formFields,
   });
 
   Map<String, dynamic> toJson() => {
@@ -197,6 +239,10 @@ class UnencryptedPackage {
         if (appVersion != null) 'appVersion': appVersion,
         if (deviceId != null) 'deviceId': deviceId,
         if (extra != null) 'extra': extra,
+        if (attachments != null && attachments!.isNotEmpty)
+          'attachments': attachments!.map((a) => a.toJson()).toList(),
+        if (formFields != null && formFields!.isNotEmpty)
+          'formFields': formFields,
       };
 
   factory UnencryptedPackage.fromJson(Map<String, dynamic> json) {
@@ -217,6 +263,16 @@ class UnencryptedPackage {
       appVersion: json['appVersion'],
       deviceId: json['deviceId'],
       extra: json['extra'],
+      attachments: json['attachments'] != null
+          ? (json['attachments'] as List)
+              .map((a) => FileAttachment.fromJson(a))
+              .toList()
+          : null,
+      formFields: json['formFields'] != null
+          ? (json['formFields'] as List)
+              .map((f) => Map<String, String>.from(f))
+              .toList()
+          : null,
     );
   }
 }
@@ -241,6 +297,12 @@ class EventData {
   final Map<String, dynamic>? extra;
   final bool isSuccess;
 
+  /// File attachments captured from FormData.
+  final List<FileAttachment>? attachments;
+
+  /// Form fields extracted from FormData (non-file entries).
+  final List<MapEntry<String, String>>? formFields;
+
   const EventData({
     required this.eventId,
     required this.timestamp,
@@ -259,9 +321,16 @@ class EventData {
     this.deviceId,
     this.extra,
     this.isSuccess = false,
+    this.attachments,
+    this.formFields,
   });
 
   StatisticalPackage toStatisticalPackage() {
+    final hasAttachments = attachments != null && attachments!.isNotEmpty;
+    final attachmentCount = attachments?.length ?? 0;
+    final totalAttachmentBytes =
+        attachments?.fold<int>(0, (sum, a) => sum + a.sizeBytes) ?? 0;
+
     return StatisticalPackage(
       eventId: eventId,
       timestamp: timestamp,
@@ -274,6 +343,9 @@ class EventData {
       deviceId: deviceId,
       isSuccess: isSuccess,
       errorType: errorType,
+      hasAttachments: hasAttachments,
+      attachmentCount: attachmentCount,
+      totalAttachmentBytes: totalAttachmentBytes,
     );
   }
 
@@ -295,6 +367,10 @@ class EventData {
       appVersion: appVersion,
       deviceId: deviceId,
       extra: extra,
+      attachments: attachments,
+      formFields: formFields
+          ?.map((e) => {'key': e.key, 'value': e.value})
+          .toList(),
     );
   }
 
@@ -305,6 +381,23 @@ class EventData {
       if (value == null) return null;
       final str = value is String ? value : jsonEncode(value);
       return encryptFn(str);
+    }
+
+    // Encrypt attachment metadata (not the file data, which is stored separately)
+    List<EncryptedFileAttachment>? encryptedAttachments;
+    if (attachments != null && attachments!.isNotEmpty) {
+      encryptedAttachments = attachments!.map((a) {
+        return EncryptedFileAttachment(
+          id: a.id,
+          encryptedFieldName: encryptFn(a.fieldName),
+          encryptedFilename: encryptFn(a.filename),
+          encryptedContentType:
+              a.contentType != null ? encryptFn(a.contentType!) : null,
+          sizeBytes: a.sizeBytes,
+          checksumSha256: a.checksumSha256,
+          localPath: a.localPath,
+        );
+      }).toList();
     }
 
     return EncryptedPackage(
@@ -324,6 +417,7 @@ class EventData {
       appVersion: appVersion,
       deviceId: deviceId,
       extra: extra,
+      attachments: encryptedAttachments,
     );
   }
 
@@ -345,6 +439,12 @@ class EventData {
         if (deviceId != null) 'deviceId': deviceId,
         if (extra != null) 'extra': extra,
         'isSuccess': isSuccess,
+        if (attachments != null && attachments!.isNotEmpty)
+          'attachments': attachments!.map((a) => a.toJson()).toList(),
+        if (formFields != null && formFields!.isNotEmpty)
+          'formFields': formFields!
+              .map((e) => {'key': e.key, 'value': e.value})
+              .toList(),
       };
 
   factory EventData.fromJson(Map<String, dynamic> json) {
@@ -366,6 +466,44 @@ class EventData {
       deviceId: json['deviceId'],
       extra: json['extra'],
       isSuccess: json['isSuccess'] ?? false,
+      attachments: json['attachments'] != null
+          ? (json['attachments'] as List)
+              .map((a) => FileAttachment.fromJson(a))
+              .toList()
+          : null,
+      formFields: json['formFields'] != null
+          ? (json['formFields'] as List)
+              .map((f) => MapEntry<String, String>(f['key'], f['value']))
+              .toList()
+          : null,
+    );
+  }
+
+  /// Create a copy with updated attachments.
+  EventData copyWithAttachments({
+    List<FileAttachment>? attachments,
+    List<MapEntry<String, String>>? formFields,
+  }) {
+    return EventData(
+      eventId: eventId,
+      timestamp: timestamp,
+      method: method,
+      url: url,
+      statusCode: statusCode,
+      errorType: errorType,
+      errorMessage: errorMessage,
+      requestHeaders: requestHeaders,
+      requestBody: requestBody,
+      responseHeaders: responseHeaders,
+      responseBody: responseBody,
+      durationMs: durationMs,
+      environment: environment,
+      appVersion: appVersion,
+      deviceId: deviceId,
+      extra: extra,
+      isSuccess: isSuccess,
+      attachments: attachments ?? this.attachments,
+      formFields: formFields ?? this.formFields,
     );
   }
 }

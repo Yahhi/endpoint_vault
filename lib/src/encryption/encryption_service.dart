@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
@@ -6,9 +7,12 @@ import 'package:encrypt/encrypt.dart' as enc;
 
 /// Service for encrypting and decrypting payloads.
 ///
-/// Uses AES-256-GCM encryption with a random IV for each encryption.
+/// Uses AES-256-CBC encryption with a random IV for each encryption.
 class EncryptionService {
   final enc.Key _key;
+
+  /// The raw key bytes for file encryption operations.
+  Uint8List get keyBytes => _key.bytes;
 
   /// Create an encryption service with the given key.
   ///
@@ -81,5 +85,79 @@ class EncryptionService {
   String fingerprint(String data) {
     final hash = sha256.convert(utf8.encode(data));
     return hash.toString().substring(0, 16);
+  }
+
+  /// Encrypt binary data and return as bytes.
+  ///
+  /// Returns bytes containing [16-byte IV][encrypted data].
+  Uint8List encryptBytes(Uint8List data) {
+    final iv = enc.IV.fromSecureRandom(16);
+    final encrypter = enc.Encrypter(
+      enc.AES(_key, mode: enc.AESMode.cbc),
+    );
+
+    final encrypted = encrypter.encryptBytes(data, iv: iv);
+
+    // Combine IV and ciphertext
+    final combined = Uint8List(16 + encrypted.bytes.length);
+    combined.setRange(0, 16, iv.bytes);
+    combined.setRange(16, combined.length, encrypted.bytes);
+
+    return combined;
+  }
+
+  /// Decrypt binary data.
+  ///
+  /// Input should be bytes from [encryptBytes] containing IV + ciphertext.
+  Uint8List decryptBytes(Uint8List encryptedData) {
+    // Extract IV and ciphertext
+    final iv = enc.IV(Uint8List.fromList(encryptedData.sublist(0, 16)));
+    final ciphertextBytes = encryptedData.sublist(16);
+
+    final encrypter = enc.Encrypter(
+      enc.AES(_key, mode: enc.AESMode.cbc),
+    );
+
+    return Uint8List.fromList(
+      encrypter.decryptBytes(
+        enc.Encrypted(Uint8List.fromList(ciphertextBytes)),
+        iv: iv,
+      ),
+    );
+  }
+
+  /// Encrypt bytes and write directly to a file.
+  ///
+  /// This is more memory-efficient for large files as it writes
+  /// the encrypted data directly to disk.
+  Future<void> encryptBytesToFile({
+    required Uint8List data,
+    required String outputPath,
+  }) async {
+    final encrypted = encryptBytes(data);
+    final file = File(outputPath);
+    await file.writeAsBytes(encrypted, flush: true);
+  }
+
+  /// Read and decrypt a file to bytes.
+  ///
+  /// Reads the encrypted file and returns the decrypted data.
+  Future<Uint8List> decryptFileToBytes(String inputPath) async {
+    final file = File(inputPath);
+    final encryptedData = await file.readAsBytes();
+    return decryptBytes(encryptedData);
+  }
+
+  /// Calculate SHA-256 checksum of bytes.
+  String checksumSha256(Uint8List data) {
+    final hash = sha256.convert(data);
+    return hash.toString();
+  }
+
+  /// Calculate SHA-256 checksum of a file.
+  Future<String> checksumSha256File(String filePath) async {
+    final file = File(filePath);
+    final bytes = await file.readAsBytes();
+    return checksumSha256(bytes);
   }
 }

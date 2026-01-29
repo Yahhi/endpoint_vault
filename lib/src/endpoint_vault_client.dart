@@ -7,13 +7,16 @@ import 'package:uuid/uuid.dart';
 import 'config.dart';
 import 'models/captured_event.dart';
 import 'models/event_package.dart';
+import 'models/file_attachment.dart';
 import 'models/pending_request.dart';
 import 'models/server_response.dart';
 import 'models/server_settings.dart';
 import 'encryption/encryption_service.dart';
 import 'redaction/redaction_rules.dart';
+import 'services/formdata_extractor.dart';
 import 'services/server_settings_service.dart';
 import 'services/retry_manager.dart';
+import 'storage/attachment_storage.dart';
 import 'storage/local_event_storage.dart';
 
 /// Main client for EndpointVault SDK.
@@ -43,6 +46,8 @@ class EndpointVault {
   final ServerSettingsService _settingsService;
   final RetryManager _retryManager;
   final LocalEventStorage _localStorage;
+  final AttachmentStorage? _attachmentStorage;
+  final FormDataExtractor? _formDataExtractor;
   final Dio _internalDio;
   final String _deviceId;
 
@@ -56,6 +61,8 @@ class EndpointVault {
     required ServerSettingsService settingsService,
     required RetryManager retryManager,
     required LocalEventStorage localStorage,
+    AttachmentStorage? attachmentStorage,
+    FormDataExtractor? formDataExtractor,
     required Dio internalDio,
     required String deviceId,
   })  : _encryption = encryption,
@@ -63,6 +70,8 @@ class EndpointVault {
         _settingsService = settingsService,
         _retryManager = retryManager,
         _localStorage = localStorage,
+        _attachmentStorage = attachmentStorage,
+        _formDataExtractor = formDataExtractor,
         _internalDio = internalDio,
         _deviceId = deviceId;
 
@@ -71,6 +80,12 @@ class EndpointVault {
 
   /// Whether local resend is enabled (from server settings).
   bool get localResendEnabled => _settingsService.localResendEnabled;
+
+  /// Attachment storage service (null if file attachments disabled).
+  AttachmentStorage? get attachmentStorage => _attachmentStorage;
+
+  /// FormData extractor service (null if file attachments disabled).
+  FormDataExtractor? get formDataExtractor => _formDataExtractor;
 
   /// Initialize EndpointVault SDK.
   ///
@@ -88,6 +103,12 @@ class EndpointVault {
     RedactionConfig redaction = const RedactionConfig(),
     RetryConfig retry = const RetryConfig(),
     bool debug = false,
+    bool captureFileAttachments = true,
+    int maxAttachmentFileSize = 52428800,
+    int maxTotalAttachmentSize = 104857600,
+    int maxAttachmentsPerEvent = 10,
+    String? attachmentStorageDir,
+    Duration attachmentRetentionDuration = const Duration(days: 7),
   }) async {
     if (_instance != null && _instance!._isInitialized) {
       if (debug) {
@@ -109,6 +130,12 @@ class EndpointVault {
       redaction: redaction,
       retry: retry,
       debug: debug,
+      captureFileAttachments: captureFileAttachments,
+      maxAttachmentFileSize: maxAttachmentFileSize,
+      maxTotalAttachmentSize: maxTotalAttachmentSize,
+      maxAttachmentsPerEvent: maxAttachmentsPerEvent,
+      attachmentStorageDir: attachmentStorageDir,
+      attachmentRetentionDuration: attachmentRetentionDuration,
     );
 
     // Create internal Dio for API calls
@@ -136,6 +163,26 @@ class EndpointVault {
       debug: debug,
     );
 
+    // Initialize attachment services if enabled
+    AttachmentStorage? attachmentStorage;
+    FormDataExtractor? formDataExtractor;
+
+    if (captureFileAttachments) {
+      attachmentStorage = AttachmentStorage(
+        encryption: encryption,
+        storageDir: attachmentStorageDir,
+        debug: debug,
+      );
+
+      formDataExtractor = FormDataExtractor(
+        storage: attachmentStorage,
+        maxFileSize: maxAttachmentFileSize,
+        maxTotalSize: maxTotalAttachmentSize,
+        maxAttachments: maxAttachmentsPerEvent,
+        debug: debug,
+      );
+    }
+
     // Get or create device ID
     final prefs = await SharedPreferences.getInstance();
     var deviceId = prefs.getString('endpoint_vault_device_id');
@@ -151,6 +198,8 @@ class EndpointVault {
       settingsService: settingsService,
       retryManager: retryManager,
       localStorage: localStorage,
+      attachmentStorage: attachmentStorage,
+      formDataExtractor: formDataExtractor,
       internalDio: internalDio,
       deviceId: deviceId,
     );
@@ -168,14 +217,36 @@ class EndpointVault {
       await retryManager.startProcessing();
     }
 
+    // Schedule attachment cleanup
+    if (captureFileAttachments) {
+      _instance!._scheduleAttachmentCleanup();
+    }
+
     if (debug) {
       print('[EndpointVault] Initialized successfully');
       print('[EndpointVault] Device ID: $deviceId');
       print('[EndpointVault] Environment: $environment');
       print('[EndpointVault] Local resend enabled: ${settingsService.localResendEnabled}');
+      print('[EndpointVault] File attachments: ${captureFileAttachments ? "enabled" : "disabled"}');
     }
 
     return _instance!;
+  }
+
+  /// Schedule periodic cleanup of old attachment files.
+  void _scheduleAttachmentCleanup() {
+    // Run cleanup on init
+    Future.microtask(() async {
+      try {
+        await _attachmentStorage?.cleanup(
+          maxAge: config.attachmentRetentionDuration,
+        );
+      } catch (e) {
+        if (config.debug) {
+          print('[EndpointVault] Attachment cleanup failed: $e');
+        }
+      }
+    });
   }
 
   /// Capture a failed request event.
@@ -191,6 +262,8 @@ class EndpointVault {
     dynamic responseBody,
     Duration? duration,
     Map<String, dynamic>? extra,
+    List<FileAttachment>? attachments,
+    List<MapEntry<String, String>>? formFields,
   }) async {
     final eventData = EventData(
       eventId: const Uuid().v4(),
@@ -210,6 +283,8 @@ class EndpointVault {
       deviceId: _deviceId,
       extra: extra,
       isSuccess: false,
+      attachments: attachments,
+      formFields: formFields,
     );
 
     await _processEvent(eventData, isError: true);
@@ -328,6 +403,11 @@ class EndpointVault {
         {PackageType.encrypted, PackageType.statistical},
       );
 
+      // Upload attachments if present
+      if (eventData.attachments != null && eventData.attachments!.isNotEmpty) {
+        await _uploadAttachments(eventData.eventId, eventData.attachments!);
+      }
+
       _notifyEventCaptured(eventData);
 
       if (config.debug) {
@@ -343,6 +423,59 @@ class EndpointVault {
           eventData,
           {PackageType.encrypted, PackageType.statistical},
         );
+      }
+    }
+  }
+
+  /// Upload attachments for an event.
+  Future<void> _uploadAttachments(
+    String eventId,
+    List<FileAttachment> attachments,
+  ) async {
+    if (_attachmentStorage == null) return;
+
+    for (final attachment in attachments) {
+      try {
+        // Read encrypted file data
+        final encryptedData = await _attachmentStorage!.readEncryptedByPath(
+          attachment.localPath,
+        );
+
+        // Upload to server
+        await _internalDio.post(
+          '/v1/events/attachments',
+          data: {
+            'eventId': eventId,
+            'attachmentId': attachment.id,
+            'fieldName': _encryption.encrypt(attachment.fieldName),
+            'filename': _encryption.encrypt(attachment.filename),
+            if (attachment.contentType != null)
+              'contentType': _encryption.encrypt(attachment.contentType!),
+            'sizeBytes': encryptedData.length,
+            'checksumSha256': attachment.checksumSha256,
+          },
+        );
+
+        // Upload the actual file data
+        await _internalDio.post(
+          '/v1/events/attachments/$eventId/${attachment.id}/data',
+          data: encryptedData,
+          options: Options(
+            contentType: 'application/octet-stream',
+          ),
+        );
+
+        // Delete local file after successful upload
+        await _attachmentStorage!.deleteByPath(attachment.localPath);
+
+        if (config.debug) {
+          print('[EndpointVault] Attachment uploaded: ${attachment.id}');
+        }
+      } catch (e) {
+        if (config.debug) {
+          print('[EndpointVault] Failed to upload attachment ${attachment.id}: $e');
+        }
+        // Keep the file for retry
       }
     }
   }
@@ -392,6 +525,17 @@ class EndpointVault {
           return false; // Will be retried with new parameters
         }
 
+        // Upload any pending attachments
+        final attachments = request.encryptedPackage!.attachments;
+        if (attachments != null && attachments.isNotEmpty) {
+          for (final attachment in attachments) {
+            await _uploadAttachmentFromEncrypted(
+              request.eventId,
+              attachment,
+            );
+          }
+        }
+
         return true;
       } else if (request.statisticalPackage != null) {
         // Send only stats
@@ -418,6 +562,60 @@ class EndpointVault {
         print('[EndpointVault] Retry failed: $e');
       }
       return false;
+    }
+  }
+
+  /// Upload attachment from encrypted metadata (for retry).
+  Future<void> _uploadAttachmentFromEncrypted(
+    String eventId,
+    EncryptedFileAttachment attachment,
+  ) async {
+    if (_attachmentStorage == null) return;
+
+    try {
+      // Check if file still exists
+      if (!await _attachmentStorage!.existsByPath(attachment.localPath)) {
+        if (config.debug) {
+          print('[EndpointVault] Attachment file not found: ${attachment.id}');
+        }
+        return;
+      }
+
+      final encryptedData = await _attachmentStorage!.readEncryptedByPath(
+        attachment.localPath,
+      );
+
+      await _internalDio.post(
+        '/v1/events/attachments',
+        data: {
+          'eventId': eventId,
+          'attachmentId': attachment.id,
+          'fieldName': attachment.encryptedFieldName,
+          'filename': attachment.encryptedFilename,
+          if (attachment.encryptedContentType != null)
+            'contentType': attachment.encryptedContentType,
+          'sizeBytes': encryptedData.length,
+          'checksumSha256': attachment.checksumSha256,
+        },
+      );
+
+      await _internalDio.post(
+        '/v1/events/attachments/$eventId/${attachment.id}/data',
+        data: encryptedData,
+        options: Options(
+          contentType: 'application/octet-stream',
+        ),
+      );
+
+      await _attachmentStorage!.deleteByPath(attachment.localPath);
+
+      if (config.debug) {
+        print('[EndpointVault] Attachment uploaded on retry: ${attachment.id}');
+      }
+    } catch (e) {
+      if (config.debug) {
+        print('[EndpointVault] Failed to upload attachment on retry: $e');
+      }
     }
   }
 
@@ -555,6 +753,18 @@ class EndpointVault {
 
   /// Get local event count.
   Future<int> get localEventCount => _localStorage.count;
+
+  /// Get attachment storage usage in bytes.
+  Future<int> get attachmentStorageBytes async {
+    return await _attachmentStorage?.totalStorageBytes() ?? 0;
+  }
+
+  /// Run attachment cleanup manually.
+  Future<int> cleanupAttachments({Duration? maxAge}) async {
+    return await _attachmentStorage?.cleanup(
+      maxAge: maxAge ?? config.attachmentRetentionDuration,
+    ) ?? 0;
+  }
 
   /// Dispose resources.
   void dispose() {
