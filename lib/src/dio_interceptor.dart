@@ -17,6 +17,18 @@ import 'services/formdata_extractor.dart';
 /// dio.get('/api/payment', options: Options(
 ///   extra: {'ev_critical': true},
 /// ));
+///
+/// // Register a replay success callback for file upload workflows
+/// dio.post('/api/upload', options: Options(
+///   extra: {
+///     'ev_critical': true,
+///     'ev_on_replay_success': (Response response) async {
+///       // Extract upload URLs from successful response and upload files
+///       final urls = response.data['uploadUrls'] as List;
+///       await uploadFilesToUrls(urls);
+///     },
+///   },
+/// ));
 /// ```
 class EndpointVaultInterceptor extends Interceptor {
   /// Only capture requests marked as critical.
@@ -146,6 +158,10 @@ class EndpointVaultInterceptor extends Interceptor {
     // Check if we should capture this error
     if (_shouldCapture(err.requestOptions) &&
         _isCriticalRequest(err.requestOptions)) {
+      // Extract replay success callback from request extras if present
+      final onReplaySuccess = err.requestOptions.extra['ev_on_replay_success']
+          as Future<void> Function(Response response)?;
+
       EndpointVault.instance.captureFailure(
         method: err.requestOptions.method,
         url: _getFullUrl(err.requestOptions),
@@ -164,6 +180,7 @@ class EndpointVaultInterceptor extends Interceptor {
         },
         attachments: pendingData?.result.attachments,
         formFields: pendingData?.result.fields,
+        onReplaySuccess: onReplaySuccess,
       );
     } else if (pendingData != null) {
       // If we're not capturing, clean up the attachment files
@@ -328,6 +345,33 @@ extension EndpointVaultOptions on Options {
       extra: {
         ...?extra,
         'ev_skip_attachments': true,
+      },
+    );
+  }
+
+  /// Set a callback to be executed when this request is successfully replayed.
+  ///
+  /// This is useful for file upload workflows where the response contains
+  /// upload URLs that need to be used after a successful retry.
+  ///
+  /// Example:
+  /// ```dart
+  /// dio.post(
+  ///   '/api/upload-urls',
+  ///   data: {'files': fileNames},
+  ///   options: Options().critical().onReplaySuccess((response) async {
+  ///     final urls = response.data['uploadUrls'] as List;
+  ///     for (var i = 0; i < urls.length; i++) {
+  ///       await uploadFile(files[i], urls[i]);
+  ///     }
+  ///   }),
+  /// );
+  /// ```
+  Options onReplaySuccess(Future<void> Function(Response response) callback) {
+    return copyWith(
+      extra: {
+        ...?extra,
+        'ev_on_replay_success': callback,
       },
     );
   }

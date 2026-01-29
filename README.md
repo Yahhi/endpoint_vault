@@ -47,6 +47,48 @@ await dio.post('/api/payment',
 - **Automatic Redaction** — Strip passwords, tokens, PII
 - **Offline Queue** — Queue events when offline
 - **Device-side Replay** — Re-execute failed requests
+- **Replay Success Callbacks** — Continue workflows after successful replays
+
+## Replay Success Callbacks
+
+For workflows that depend on response data (like file uploads), use the `onReplaySuccess` callback to continue processing after a successful replay:
+
+```dart
+// Using the interceptor with Options extension
+await dio.post(
+  '/api/get-upload-urls',
+  data: {'files': fileNames},
+  options: Options().critical().onReplaySuccess((response) async {
+    // Called when the request is successfully replayed
+    final urls = response.data['uploadUrls'] as List;
+    for (var i = 0; i < urls.length; i++) {
+      await uploadFile(files[i], urls[i]);
+    }
+  }),
+);
+
+// Or using captureFailure directly
+await EndpointVault.instance.captureFailure(
+  method: 'POST',
+  url: 'https://api.example.com/upload-urls',
+  statusCode: 500,
+  errorType: 'server_error',
+  onReplaySuccess: (response) async {
+    // Extract URLs and upload files
+    final urls = response.data['uploadUrls'] as List;
+    await uploadFilesToUrls(urls);
+  },
+);
+
+// Execute a replay manually
+final replayRequest = await EndpointVault.instance.checkForReplayRequest();
+if (replayRequest != null) {
+  await EndpointVault.instance.executeReplay(
+    replayRequest: replayRequest,
+    dio: myAppDio,  // Your app's Dio instance
+  );
+}
+```
 
 ## Documentation
 

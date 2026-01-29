@@ -54,6 +54,11 @@ class EndpointVault {
   bool _isInitialized = false;
   StreamController<CapturedEvent>? _eventStreamController;
 
+  /// Stores replay success callbacks indexed by eventId.
+  /// Called when a replay request succeeds to allow continuation of workflows
+  /// like file uploads that depend on response data.
+  final Map<String, Future<void> Function(Response response)> _replaySuccessCallbacks = {};
+
   EndpointVault._({
     required this.config,
     required EncryptionService encryption,
@@ -250,6 +255,31 @@ class EndpointVault {
   }
 
   /// Capture a failed request event.
+  ///
+  /// The [onReplaySuccess] callback is called when this request is successfully
+  /// replayed (either via local resend or server-triggered replay). This is useful
+  /// for workflows that depend on response data, such as:
+  ///
+  /// - Extracting file upload URLs from the response
+  /// - Continuing multi-step operations after retry
+  /// - Triggering dependent API calls
+  ///
+  /// Example usage for file upload workflows:
+  /// ```dart
+  /// EndpointVault.instance.captureFailure(
+  ///   method: 'POST',
+  ///   url: 'https://api.example.com/upload',
+  ///   statusCode: 500,
+  ///   errorType: 'server_error',
+  ///   onReplaySuccess: (Response response) async {
+  ///     // Extract upload URLs from the successful response
+  ///     final uploadUrls = response.data['uploadUrls'] as List;
+  ///     for (final url in uploadUrls) {
+  ///       await uploadFileToUrl(url);
+  ///     }
+  ///   },
+  /// );
+  /// ```
   Future<void> captureFailure({
     required String method,
     required String url,
@@ -264,9 +294,12 @@ class EndpointVault {
     Map<String, dynamic>? extra,
     List<FileAttachment>? attachments,
     List<MapEntry<String, String>>? formFields,
+    Future<void> Function(Response response)? onReplaySuccess,
   }) async {
+    final eventId = const Uuid().v4();
+
     final eventData = EventData(
-      eventId: const Uuid().v4(),
+      eventId: eventId,
       timestamp: DateTime.now().toUtc(),
       method: method,
       url: url,
@@ -286,6 +319,15 @@ class EndpointVault {
       attachments: attachments,
       formFields: formFields,
     );
+
+    // Store the replay success callback if provided
+    if (onReplaySuccess != null) {
+      _replaySuccessCallbacks[eventId] = onReplaySuccess;
+
+      if (config.debug) {
+        print('[EndpointVault] Stored replay success callback for event: $eventId');
+      }
+    }
 
     await _processEvent(eventData, isError: true);
   }
@@ -743,6 +785,226 @@ class EndpointVault {
     }
   }
 
+  /// Execute a replay request using the stored local event data.
+  ///
+  /// This method:
+  /// 1. Retrieves the original request data from local storage
+  /// 2. Replays the request using the provided Dio instance
+  /// 3. Reports the result to the EndpointVault server
+  /// 4. Calls the [onReplaySuccess] callback if the replay succeeds
+  ///
+  /// The [dio] parameter should be your app's Dio instance (NOT EndpointVault's internal one)
+  /// so that the replayed request goes through your normal interceptors and authentication.
+  ///
+  /// Returns `true` if the replay was successful, `false` otherwise.
+  ///
+  /// Example usage:
+  /// ```dart
+  /// // Check for pending replay requests
+  /// final replayRequest = await EndpointVault.instance.checkForReplayRequest();
+  /// if (replayRequest != null) {
+  ///   final success = await EndpointVault.instance.executeReplay(
+  ///     replayRequest: replayRequest,
+  ///     dio: myAppDio,  // Your app's Dio instance
+  ///   );
+  ///   print('Replay ${success ? "succeeded" : "failed"}');
+  /// }
+  /// ```
+  Future<bool> executeReplay({
+    required ReplayRequest replayRequest,
+    required Dio dio,
+  }) async {
+    try {
+      // Get the original request data from local storage
+      final localEvent = await getLocalEvent(replayRequest.eventId);
+      if (localEvent == null) {
+        if (config.debug) {
+          print('[EndpointVault] Local event not found for replay: ${replayRequest.eventId}');
+        }
+        await reportReplayResult(
+          replayId: replayRequest.id,
+          success: false,
+          errorMessage: 'Local event data not found',
+        );
+        return false;
+      }
+
+      // Prepare request options
+      final options = Options(
+        method: localEvent.method,
+        headers: localEvent.requestHeaders?.map((k, v) => MapEntry(k, v.toString())),
+        extra: {
+          'ev_skip': true,  // Skip capturing this replay request
+        },
+      );
+
+      // Execute the replay
+      final response = await dio.request<dynamic>(
+        localEvent.url,
+        data: localEvent.requestBody,
+        options: options,
+      );
+
+      // Report success to server
+      await reportReplayResult(
+        replayId: replayRequest.id,
+        success: true,
+        statusCode: response.statusCode,
+      );
+
+      // Remove the local event after successful replay
+      await removeLocalEvent(replayRequest.eventId);
+
+      // Call the stored replay success callback if available
+      final callback = _replaySuccessCallbacks.remove(replayRequest.eventId);
+      if (callback != null) {
+        try {
+          await callback(response);
+          if (config.debug) {
+            print('[EndpointVault] Replay success callback executed for event: ${replayRequest.eventId}');
+          }
+        } catch (e) {
+          if (config.debug) {
+            print('[EndpointVault] Replay success callback failed: $e');
+          }
+          // Don't fail the replay itself if callback fails
+        }
+      }
+
+      if (config.debug) {
+        print('[EndpointVault] Replay successful: ${replayRequest.method} ${replayRequest.url}');
+      }
+
+      return true;
+    } on DioException catch (e) {
+      // Report failure to server
+      await reportReplayResult(
+        replayId: replayRequest.id,
+        success: false,
+        statusCode: e.response?.statusCode,
+        errorMessage: e.message,
+      );
+
+      if (config.debug) {
+        print('[EndpointVault] Replay failed: ${e.message}');
+      }
+
+      return false;
+    } catch (e) {
+      // Report failure to server
+      await reportReplayResult(
+        replayId: replayRequest.id,
+        success: false,
+        errorMessage: e.toString(),
+      );
+
+      if (config.debug) {
+        print('[EndpointVault] Replay failed: $e');
+      }
+
+      return false;
+    }
+  }
+
+  /// Execute a replay using the original request data directly.
+  ///
+  /// Use this when you have the original request data available (e.g., from a local queue)
+  /// and want to retry it with a callback on success.
+  ///
+  /// The [eventId] should match the ID used when capturing the failure.
+  ///
+  /// Example usage:
+  /// ```dart
+  /// // Get local event
+  /// final event = await EndpointVault.instance.getLocalEvent(eventId);
+  /// if (event != null) {
+  ///   final success = await EndpointVault.instance.replayLocalEvent(
+  ///     eventId: eventId,
+  ///     dio: myAppDio,
+  ///   );
+  /// }
+  /// ```
+  Future<bool> replayLocalEvent({
+    required String eventId,
+    required Dio dio,
+  }) async {
+    final localEvent = await getLocalEvent(eventId);
+    if (localEvent == null) {
+      if (config.debug) {
+        print('[EndpointVault] Local event not found: $eventId');
+      }
+      return false;
+    }
+
+    try {
+      final options = Options(
+        method: localEvent.method,
+        headers: localEvent.requestHeaders?.map((k, v) => MapEntry(k, v.toString())),
+        extra: {
+          'ev_skip': true,  // Skip capturing this replay request
+        },
+      );
+
+      final response = await dio.request<dynamic>(
+        localEvent.url,
+        data: localEvent.requestBody,
+        options: options,
+      );
+
+      // Remove the local event after successful replay
+      await removeLocalEvent(eventId);
+
+      // Call the stored replay success callback if available
+      final callback = _replaySuccessCallbacks.remove(eventId);
+      if (callback != null) {
+        try {
+          await callback(response);
+          if (config.debug) {
+            print('[EndpointVault] Replay success callback executed for event: $eventId');
+          }
+        } catch (e) {
+          if (config.debug) {
+            print('[EndpointVault] Replay success callback failed: $e');
+          }
+        }
+      }
+
+      if (config.debug) {
+        print('[EndpointVault] Local event replay successful: ${localEvent.method} ${localEvent.url}');
+      }
+
+      return true;
+    } on DioException catch (e) {
+      if (config.debug) {
+        print('[EndpointVault] Local event replay failed: ${e.message}');
+      }
+      return false;
+    } catch (e) {
+      if (config.debug) {
+        print('[EndpointVault] Local event replay failed: $e');
+      }
+      return false;
+    }
+  }
+
+  /// Get the replay success callback for an event (if one was registered).
+  ///
+  /// This is useful if you want to manually execute the callback or check
+  /// if a callback exists for a given event.
+  Future<void> Function(Response response)? getReplaySuccessCallback(String eventId) {
+    return _replaySuccessCallbacks[eventId];
+  }
+
+  /// Remove a replay success callback without executing it.
+  ///
+  /// Use this to clean up callbacks for events that will never be replayed.
+  void removeReplaySuccessCallback(String eventId) {
+    _replaySuccessCallbacks.remove(eventId);
+  }
+
+  /// Get the count of registered replay success callbacks.
+  int get replaySuccessCallbackCount => _replaySuccessCallbacks.length;
+
   /// Refresh server settings.
   Future<void> refreshSettings() async {
     await _settingsService.fetchSettings();
@@ -772,6 +1034,7 @@ class EndpointVault {
     _retryManager.dispose();
     _localStorage.dispose();
     _internalDio.close();
+    _replaySuccessCallbacks.clear();
   }
 }
 
